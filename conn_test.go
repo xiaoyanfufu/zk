@@ -2,8 +2,12 @@ package zk
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"io/ioutil"
+	"net"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -109,6 +113,117 @@ func TestDeadlockInClose(t *testing.T) {
 	case <-okChan:
 	case <-time.After(3 * time.Second):
 		t.Fatal("apparent deadlock!")
+	}
+}
+
+func TestResendZkAuthSASLTokenProvider(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	conn := &Conn{
+		conn:        client,
+		server:      "zk-1.example.com:2181",
+		eventChan:   make(chan Event, 1),
+		shouldQuit:  make(chan struct{}),
+		closeChan:   make(chan struct{}),
+		requests:    make(map[int32]*request),
+		buf:         make([]byte, bufferSize),
+		recvTimeout: time.Second,
+		logger:      DefaultLogger,
+		logInfo:     false,
+		saslTokenProvider: func(serverName string) ([]byte, error) {
+			if serverName != "zk-1.example.com:2181" {
+				t.Fatalf("provider saw server %q, want %q", serverName, "zk-1.example.com:2181")
+			}
+			return []byte{1, 2, 3}, nil
+		},
+	}
+
+	serverDone := make(chan error, 1)
+	recvDone := make(chan error, 1)
+	go func() {
+		recvDone <- conn.recvLoop(client)
+	}()
+
+	go func() {
+		lengthBuf := make([]byte, 4)
+		if _, err := io.ReadFull(server, lengthBuf); err != nil {
+			serverDone <- err
+			return
+		}
+
+		plen := int(binary.BigEndian.Uint32(lengthBuf))
+		packet := make([]byte, plen)
+		if _, err := io.ReadFull(server, packet); err != nil {
+			serverDone <- err
+			return
+		}
+
+		reqHdr := requestHeader{}
+		n, err := decodePacket(packet, &reqHdr)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		if reqHdr.Opcode != opSasl {
+			serverDone <- fmt.Errorf("opcode = %d, want %d", reqHdr.Opcode, opSasl)
+			return
+		}
+
+		req := setSaslRequest{}
+		if _, err := decodePacket(packet[n:], &req); err != nil {
+			serverDone <- err
+			return
+		}
+		if !reflect.DeepEqual(req.Token, []byte{1, 2, 3}) {
+			serverDone <- fmt.Errorf("request token = %v, want %v", req.Token, []byte{1, 2, 3})
+			return
+		}
+
+		respBuf := make([]byte, 4+bufferSize)
+		respHdr := responseHeader{Xid: reqHdr.Xid, Zxid: 42}
+		n, err = encodePacket(respBuf[4:], &respHdr)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		n2, err := encodePacket(respBuf[4+n:], &setSaslResponse{Token: []byte{4, 5, 6}})
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		binary.BigEndian.PutUint32(respBuf[:4], uint32(n+n2))
+		if _, err := server.Write(respBuf[:4+n+n2]); err != nil {
+			serverDone <- err
+			return
+		}
+
+		serverDone <- nil
+	}()
+
+	if err := resendZkAuth(context.Background(), conn); err != nil {
+		t.Fatalf("resendZkAuth returned error: %+v", err)
+	}
+
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("server handler returned error: %+v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for server handler")
+	}
+
+	client.Close()
+	select {
+	case <-recvDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for recvLoop")
+	}
+
+	if got := conn.State(); got != StateSaslAuthenticated {
+		t.Fatalf("conn.State() = %v, want %v", got, StateSaslAuthenticated)
 	}
 }
 

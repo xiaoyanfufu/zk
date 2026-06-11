@@ -67,6 +67,10 @@ type authCreds struct {
 	auth   []byte
 }
 
+// SASLTokenProvider creates a SASL token for the currently connected ZooKeeper server.
+// It is primarily used by Kerberos/GSSAPI callers that need host-specific service tickets.
+type SASLTokenProvider func(server string) ([]byte, error)
+
 // Conn is the client connection and tracks all details for communication with the server.
 type Conn struct {
 	lastZxid         int64
@@ -113,6 +117,8 @@ type Conn struct {
 	logInfo bool // true if information messages are logged; false if only errors are logged
 
 	buf []byte
+
+	saslTokenProvider SASLTokenProvider
 }
 
 // connOption represents a connection option.
@@ -307,6 +313,14 @@ func WithMaxBufferSize(maxBufferSize int) connOption {
 func WithMaxConnBufferSize(maxBufferSize int) connOption {
 	return func(c *Conn) {
 		c.buf = make([]byte, maxBufferSize)
+	}
+}
+
+// WithSASLTokenProvider returns a connection option that generates a SASL token
+// for the current ZooKeeper server on initial connect and every reconnect.
+func WithSASLTokenProvider(provider SASLTokenProvider) connOption {
+	return func(c *Conn) {
+		c.saslTokenProvider = provider
 	}
 }
 
@@ -970,6 +984,18 @@ func (c *Conn) AddAuth(scheme string, auth []byte) error {
 	return nil
 }
 
+// SASLAuth performs ZooKeeper's SASL token exchange using the dedicated SASL
+// opcode. Kerberos clients should use this instead of AddAuth("sasl", ...).
+func (c *Conn) SASLAuth(token []byte) ([]byte, error) {
+	res := &setSaslResponse{}
+	_, err := c.request(opSasl, &setSaslRequest{Token: token}, res, nil)
+	if err != nil {
+		return nil, err
+	}
+	c.setState(StateSaslAuthenticated)
+	return res.Token, nil
+}
+
 // Children returns the children of a znode.
 func (c *Conn) Children(path string) ([]string, *Stat, error) {
 	if err := validatePath(path, false); err != nil {
@@ -1372,6 +1398,47 @@ func resendZkAuth(ctx context.Context, c *Conn) error {
 
 	if c.logInfo {
 		c.logger.Printf("re-submitting `%d` credentials after reconnect", len(c.creds))
+	}
+
+	if c.saslTokenProvider != nil {
+		server := c.Server()
+		c.logger.Printf("re-submitting sasl token via provider for server=%s", server)
+		token, err := c.saslTokenProvider(server)
+		if err != nil {
+			return fmt.Errorf("failed to generate sasl token for %s: %v", server, err)
+		}
+		if len(token) > 0 {
+			if shouldCancel() {
+				return nil
+			}
+			resChan, err := c.sendRequest(
+				opSasl,
+				&setSaslRequest{Token: token},
+				&setSaslResponse{},
+				nil,
+			)
+			if err != nil {
+				return fmt.Errorf("failed to send sasl auth request: %v", err)
+			}
+
+			var res response
+			select {
+			case res = <-resChan:
+			case <-c.closeChan:
+				c.logger.Printf("recv closed, cancel re-submitting sasl auth")
+				return nil
+			case <-c.shouldQuit:
+				c.logger.Printf("should quit, cancel re-submitting sasl auth")
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			if res.err != nil {
+				return fmt.Errorf("failed connection sasl auth request: %v", res.err)
+			}
+			c.logger.Printf("re-submitted sasl token successfully for server=%s", server)
+			c.setState(StateSaslAuthenticated)
+		}
 	}
 
 	for _, cred := range c.creds {

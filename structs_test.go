@@ -10,6 +10,8 @@ func TestEncodeDecodePacket(t *testing.T) {
 	encodeDecodeTest(t, &requestHeader{-2, 5})
 	encodeDecodeTest(t, &connectResponse{1, 2, 3, nil})
 	encodeDecodeTest(t, &connectResponse{1, 2, 3, []byte{4, 5, 6}})
+	encodeDecodeTest(t, &setSaslRequest{Token: []byte{1, 2, 3, 4}})
+	encodeDecodeTest(t, &setSaslResponse{Token: []byte{5, 6, 7, 8}})
 	encodeDecodeTest(t, &getAclResponse{[]ACL{{12, "s", "anyone"}}, Stat{}})
 	encodeDecodeTest(t, &getChildrenResponse{[]string{"foo", "bar"}})
 	encodeDecodeTest(t, &pathWatchRequest{"path", true})
@@ -26,6 +28,13 @@ func TestRequestStructForOp(t *testing.T) {
 				t.Errorf("No struct for op %s", name)
 			}
 		}
+	}
+
+	if got := requestStructForOp(opSasl); got == nil {
+		t.Fatalf("requestStructForOp(opSasl) returned nil")
+	}
+	if got := opNames[opSasl]; got != "sasl" {
+		t.Fatalf("opNames[opSasl] = %q, want %q", got, "sasl")
 	}
 }
 
